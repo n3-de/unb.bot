@@ -1,4 +1,5 @@
-discord.py>=2.3.0
-unbelievaboat>=2.2.0
-matplotlib>=3.7.0
-requests>=2.31.0
+discord.py
+requests
+matplotlib
+unbelievaboat
+Flask
