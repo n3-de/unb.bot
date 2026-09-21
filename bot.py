@@ -26,7 +26,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ===== UNBELIEVABOAT =====
-ub = UBClient(UB_TOKEN)
+ub = None
 
 # ===== РАБОТА С ФАЙЛАМИ =====
 def load_json(path, default):
@@ -80,6 +80,11 @@ def calculate_rate(total_balance):
 # ===== КОМАНДЫ =====
 @bot.event
 async def on_ready():
+    global ub
+
+    if ub is None:
+        ub = UBClient(UB_TOKEN)
+
     print(f"Бот {bot.user} запущен.")
 
 @bot.command(name="print_money")
