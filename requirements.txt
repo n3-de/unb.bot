@@ -1,5 +1,8 @@
-discord.py
-requests
-matplotlib
-unbelievaboat
-Flask
+discord.py>=2.3.0
+unbelievaboat>=2.2.0
+motor>=3.5.0
+matplotlib>=3.7.0
+requests>=2.31.0
+huggingface_hub>=0.28.0
+Flask>=3.0.0
+waitress>=3.0.0
