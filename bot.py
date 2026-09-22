@@ -570,4 +570,278 @@ class CentralBankBot(commands.Bot):
             embed.add_field(name="📥 Доходы (24ч)", value=income, inline=False)
 
         if stats['outcome_by_reason']:
-         
+            outcome = "\n".join([f"**{k}**: -{v:,}" for k, v in stats['outcome_by_reason'].items()])
+            embed.add_field(name="📤 Расходы (24ч)", value=outcome, inline=False)
+
+        await ctx.send(embed=embed)
+
+    # ---------- SALARY ----------
+
+    @commands.command(name="salary")
+    async def salary(self, ctx):
+        allowed, msg = await self.cooldowns.check_and_set(
+            str(ctx.author.id), "salary", SALARY_COOLDOWN_HOURS
+        )
+        if not allowed:
+            await ctx.send(f"⏳ Зарплата будет через **{msg}**.")
+            return
+
+        if not await self.spend_from_reserve(SALARY_AMOUNT, f"user_{ctx.author.id}", "Зарплата"):
+            await ctx.send("❌ В ЦБ недостаточно средств.")
+            return
+
+        user = await self.ub.get_user_balance(str(ctx.author.id))
+        await user.update(cash=user.cash + SALARY_AMOUNT)
+
+        await ctx.send(f"💵 Ты получил **{SALARY_AMOUNT:,}** монет.")
+
+    # ---------- TAX ----------
+
+    @commands.command(name="tax")
+    @commands.has_permissions(administrator=True)
+    async def tax(self, ctx, member: discord.Member, amount: int):
+        if amount <= 0:
+            await ctx.send("❌ Сумма должна быть положительной.")
+            return
+
+        user = await self.ub.get_user_balance(str(member.id))
+        if user.cash < amount:
+            await ctx.send(f"❌ У {member.mention} недостаточно денег.")
+            return
+
+        await user.update(cash=user.cash - amount)
+
+        if not await self.income_to_reserve(amount, f"user_{member.id}", "Налог"):
+            await user.update(cash=user.cash + amount)
+            await ctx.send("❌ Не удалось зачислить в ЦБ. Откат выполнен.")
+            return
+
+        await ctx.send(f"💰 Налог **{amount:,}** списан у {member.mention}.")
+
+    # ---------- BET ----------
+
+    @commands.command(name="bet")
+    async def bet(self, ctx, amount: int):
+        if amount <= 0:
+            await ctx.send("❌ Ставка должна быть положительной.")
+            return
+
+        user = await self.ub.get_user_balance(str(ctx.author.id))
+        if user.cash < amount:
+            await ctx.send("❌ У тебя недостаточно денег.")
+            return
+
+        import random
+        if random.choice([True, False]):
+            # Победа
+            if not await self.spend_from_reserve(amount, f"user_{ctx.author.id}", "Выигрыш казино"):
+                await ctx.send("❌ ЦБ не может выплатить.")
+                return
+            await user.update(cash=user.cash + amount)
+            await ctx.send(f"🎰 Победа! **+{amount:,}**")
+        else:
+            # Проигрыш
+            await user.update(cash=user.cash - amount)
+            if not await self.income_to_reserve(amount, f"user_{ctx.author.id}", "Проигрыш казино"):
+                await user.update(cash=user.cash + amount)
+                await ctx.send("❌ Ошибка. Откат.")
+                return
+            await ctx.send(f"🎰 Проигрыш. **-{amount:,}**")
+
+    # ---------- CRIME ----------
+
+    @commands.command(name="crime")
+    async def crime(self, ctx, amount: int):
+        if amount <= 0:
+            await ctx.send("❌ Сумма должна быть положительной.")
+            return
+
+        user = await self.ub.get_user_balance(str(ctx.author.id))
+        if user.cash < amount:
+            await ctx.send("❌ У тебя недостаточно денег.")
+            return
+
+        import random
+        if random.random() < 0.4:  # 40%
+            reward = amount * 2
+            if not await self.spend_from_reserve(reward, f"user_{ctx.author.id}", "Успех crime"):
+                await ctx.send("❌ ЦБ не может выплатить.")
+                return
+            await user.update(cash=user.cash + reward)
+            await ctx.send(f"🦹 Успех! **+{reward:,}**")
+        else:
+            await user.update(cash=user.cash - amount)
+            if not await self.income_to_reserve(amount, f"user_{ctx.author.id}", "Провал crime"):
+                await user.update(cash=user.cash + amount)
+                await ctx.send("❌ Ошибка. Откат.")
+                return
+            await ctx.send(f"🚔 Провал. **-{amount:,}**")
+
+    # ---------- FUNDS ----------
+
+    @commands.command(name="fund")
+    async def fund(self, ctx, fund_name: str = "all"):
+        cb = await self.get_central_bank()
+        if fund_name == "all":
+            embed = discord.Embed(title="🏛️ Фонды", color=0x00BFFF)
+            embed.add_field(name="🤝 Соцфонд", value=f"{cb.get('welfare_fund', 0):,}", inline=True)
+            embed.add_field(name="🎉 Ивенты", value=f"{cb.get('event_fund', 0):,}", inline=True)
+            embed.add_field(name="🎁 Награды", value=f"{cb.get('reward_fund', 0):,}", inline=True)
+            await ctx.send(embed=embed)
+            return
+        fmap = {"welfare": "welfare_fund", "event": "event_fund", "reward": "reward_fund"}
+        if fund_name not in fmap:
+            await ctx.send("❌ Доступно: welfare, event, reward")
+            return
+        await ctx.send(f"🏛️ {fund_name}: **{cb.get(fmap[fund_name], 0):,}**")
+
+    @commands.command(name="fund_add")
+    @commands.has_permissions(administrator=True)
+    async def fund_add(self, ctx, fund_name: str, amount: int):
+        if amount <= 0:
+            await ctx.send("❌ Сумма должна быть положительной.")
+            return
+        fmap = {"welfare": "welfare_fund", "event": "event_fund", "reward": "reward_fund"}
+        if fund_name not in fmap:
+            await ctx.send("❌ Доступно: welfare, event, reward")
+            return
+        if not await self.spend_from_reserve(amount, f"fund_{fund_name}", f"Пополнение {fund_name}"):
+            await ctx.send("❌ В ЦБ недостаточно средств.")
+            return
+        await self.economy_collection.update_one(
+            {"_id": "central_bank"},
+            {"$inc": {fmap[fund_name]: amount}}
+        )
+        await ctx.send(f"✅ +{amount:,} в фонд **{fund_name}**")
+
+    @commands.command(name="fund_take")
+    @commands.has_permissions(administrator=True)
+    async def fund_take(self, ctx, fund_name: str, amount: int, member: discord.Member):
+        if amount <= 0:
+            await ctx.send("❌ Сумма должна быть положительной.")
+            return
+        fmap = {"welfare": "welfare_fund", "event": "event_fund", "reward": "reward_fund"}
+        if fund_name not in fmap:
+            await ctx.send("❌ Доступно: welfare, event, reward")
+            return
+        cb = await self.get_central_bank()
+        if cb.get(fmap[fund_name], 0) < amount:
+            await ctx.send("❌ В фонде недостаточно.")
+            return
+        await self.economy_collection.update_one(
+            {"_id": "central_bank"},
+            {"$inc": {fmap[fund_name]: -amount}}
+        )
+        user = await self.ub.get_user_balance(str(member.id))
+        await user.update(cash=user.cash + amount)
+        await self.add_transaction(f"fund_{fund_name}", f"user_{member.id}", amount, f"Выдача из {fund_name}")
+        await ctx.send(f"✅ {member.mention} получил **{amount:,}** из фонда {fund_name}.")
+
+    # ---------- RATE ----------
+
+    @commands.command(name="rate")
+    async def rate(self, ctx):
+        total = await self.get_total_balance()
+        coin_rub = await self.calculate_rate(total)
+        usd = await currency_cache.get_rate(USD_CODE)
+        eur = await currency_cache.get_rate(EUR_CODE)
+        cny = await currency_cache.get_rate(CNY_CODE)
+
+        coin_usd = coin_rub / usd if usd > 0 else 0
+        coin_eur = coin_rub / eur if eur > 0 else 0
+        coin_cny = coin_rub / cny if cny > 0 else 0
+
+        embed = discord.Embed(title="📈 Курс валюты", color=0x00FF00)
+        embed.add_field(
+            name="1 монета",
+            value=(
+                f"≈ **{coin_rub:.4f}** ₽\n"
+                f"≈ **{coin_usd:.4f}** $\n"
+                f"≈ **{coin_eur:.4f}** €\n"
+                f"≈ **{coin_cny:.4f}** ¥"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="Курсы ЦБ РФ",
+            value=f"USD: {usd:.2f} ₽\nEUR: {eur:.2f} ₽\nCNY: {cny:.2f} ₽",
+            inline=False
+        )
+        await ctx.send(embed=embed)
+
+        await self.db["stats"].update_one(
+            {"_id": "rate_history"},
+            {"$push": {"history": {"date": datetime.now().strftime("%d.%m"), "rate": round(coin_rub, 4)}}},
+            upsert=True
+        )
+
+    # ---------- CHART ----------
+
+    @commands.command(name="chart")
+    async def chart(self, ctx):
+        doc = await self.db["stats"].find_one({"_id": "rate_history"})
+        history = doc["history"] if doc else []
+
+        if len(history) < 2:
+            await ctx.send("📉 Мало данных. Повтори `!rate`.")
+            return
+
+        dates = [h["date"] for h in history[-30:]]
+        rates = [h["rate"] for h in history[-30:]]
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(dates, rates, marker="o", color="#00BFFF")
+        plt.title("Курс валюты")
+        plt.xlabel("Дата")
+        plt.ylabel("₽")
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight", dpi=80)
+        buf.seek(0)
+        plt.close()
+
+        await ctx.send(file=discord.File(buf, filename="chart.png"))
+
+    # ---------- TOP ----------
+
+    @commands.command(name="top")
+    async def top(self, ctx, limit: int = 10):
+        limit = max(1, min(25, limit))
+        lb = await self.ub.get_guild_leaderboard(str(GUILD_ID), limit=limit)
+        lines = [
+            f"**{i}.** {u.get('username', 'Unknown')} — `{u.get('total', 0)}`"
+            for i, u in enumerate(lb, 1)
+        ]
+        if not lines:
+            lines = ["Нет данных."]
+        embed = discord.Embed(title=f"🏆 Топ-{limit}", description="\n".join(lines), color=0xFFD700)
+        await ctx.send(embed=embed)
+
+
+# ====================================================================
+# ТОЧКА ВХОДА
+# ====================================================================
+
+def main():
+    validate_config()
+
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("🌐 Веб-сервер запущен")
+
+    bot = CentralBankBot()
+
+    try:
+        bot.run(DISCORD_TOKEN)
+    except discord.LoginFailure:
+        logger.critical("❌ Неверный токен Discord!")
+    except Exception as e:
+        logger.critical(f"❌ Критическая ошибка: {type(e).__name__}: {e}")
+    finally:
+        logger.info("Процесс завершён")
+
+
+if __name__ == "__main__":
+    main()
