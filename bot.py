@@ -33,7 +33,7 @@ from unbelievaboat import Client as UBClient
 # ====================================================================
 
 BOT_VERSION = "1.1.0"
-MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash-0731"
+MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
 
 logging.basicConfig(
     level=logging.INFO,
