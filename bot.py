@@ -1,5 +1,5 @@
 # ====================================================================
-# Central Bank Bot - Version 1.5.0
+# Central Bank Bot - Version 1.9.0
 # Commands are registered through a Cog so both ! and / commands work.
 # ====================================================================
 
@@ -38,7 +38,7 @@ from unbelievaboat import Client as UBClient
 # CONFIG
 # ====================================================================
 
-BOT_VERSION = "1.7.0"
+BOT_VERSION = "1.9.0"
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
 
 logging.basicConfig(
@@ -231,10 +231,10 @@ class CentralBankBot(commands.Bot):
         intents.members = True
 
         super().__init__(
-            command_prefix="!",
+            command_prefix=commands.when_mentioned_or("!"),
             intents=intents,
             help_command=None,
-            activity=discord.Game(name="Центробанк"),
+            activity=discord.Game(name="!cb"),
             status=discord.Status.online,
         )
 
@@ -383,6 +383,27 @@ class CentralBankBot(commands.Bot):
             len(self.commands),
         )
 
+        # Синхронизируем slash-команды сразу после загрузки Cog.
+        # Так /команды не зависят от повторного on_ready.
+        try:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            logger.info(
+                "✅ Slash-команд синхронизировано: %s",
+                len(synced),
+            )
+            logger.info(
+                "📋 Команды: %s",
+                ", ".join(command.name for command in synced),
+            )
+            self._synced = True
+        except Exception as exc:
+            logger.exception(
+                "❌ Ошибка синхронизации slash-команд: %s",
+                exc,
+            )
+
     async def close(self):
         logger.info("⚠️ Завершение работы...")
 
@@ -419,6 +440,8 @@ class CentralBankBot(commands.Bot):
                 await self.send_help_message(message)
                 return
 
+        # Важно: prefix-команды читаются только при включённом
+        # Message Content Intent в Discord Developer Portal.
         await self.process_commands(message)
 
     async def send_help_message(self, message):
@@ -437,30 +460,21 @@ class CentralBankBot(commands.Bot):
             self.user.id if self.user else "unknown",
         )
 
+        # setup_hook уже синхронизирует команды.
+        # Здесь оставляем только fallback на случай временной ошибки.
         if not self._synced:
             try:
                 guild = discord.Object(id=GUILD_ID)
-
-                # Копируем hybrid-команды в конкретный сервер.
                 self.tree.copy_global_to(guild=guild)
-
                 synced = await self.tree.sync(guild=guild)
-
                 logger.info(
-                    "✅ Slash-команд синхронизировано: %s",
+                    "✅ Slash-команд синхронизировано (fallback): %s",
                     len(synced),
                 )
-
-                logger.info(
-                    "📋 Команды: %s",
-                    ", ".join(command.name for command in synced),
-                )
-
                 self._synced = True
-
             except Exception as exc:
                 logger.exception(
-                    "❌ Ошибка синхронизации slash-команд: %s",
+                    "❌ Ошибка fallback-синхронизации slash-команд: %s",
                     exc,
                 )
 
@@ -480,6 +494,7 @@ class CentralBankBot(commands.Bot):
 
     async def on_command_error(self, ctx, error):
         if isinstance(error, commands.CommandNotFound):
+            await ctx.send("❌ Неизвестная команда. Напиши `!help`.")
             return
 
         if isinstance(error, commands.MissingPermissions):
@@ -562,7 +577,6 @@ class CentralBankCog(commands.Cog):
             value=(
                 "`!print_money` • `/print_money` — печать\n"
                 "`!burn_money` / `/burn_money` — сжечь деньги из ЦБ\n"
-                "`!tax` • `/tax` — налог\n"
                 "`!fund` • `/fund` — список фондов\n"
                 "`!fund_create` • `/fund_create` — создать фонд\n"
                 "`!fund_add` • `/fund_add` — пополнить фонд\n"
@@ -652,14 +666,11 @@ class CentralBankCog(commands.Cog):
 
         if not await self.change_reserve(amount):
             return False
-
-        await self.add_transaction(
-            source,
-            "central_bank",
-            amount,
-            reason,
-        )
-
+        try:
+            await self.add_transaction(source, "central_bank", amount, reason)
+        except Exception:
+            await self.change_reserve(-amount)
+            raise
         return True
 
     async def spend_from_reserve(
@@ -673,15 +684,69 @@ class CentralBankCog(commands.Cog):
 
         if not await self.change_reserve(-amount):
             return False
-
-        await self.add_transaction(
-            "central_bank",
-            destination,
-            amount,
-            reason,
-        )
-
+        try:
+            await self.add_transaction("central_bank", destination, amount, reason)
+        except Exception:
+            await self.change_reserve(amount)
+            raise
         return True
+
+    # ----------------------------------------------------------------
+    # CONTROLLED MONEY TRANSFERS
+    # ----------------------------------------------------------------
+    # Все операции, которые должен контролировать ЦБ, проходят через
+    # эти функции. Прямые изменения UB сторонними командами отследить
+    # автоматически нельзя, поэтому экономические команды бота должны
+    # использовать этот слой.
+
+    async def ub_get_user(self, member_id: int):
+        if self.bot.ub_guild is None:
+            raise RuntimeError("UnbelievaBoat недоступен")
+        return await self.bot.ub_guild.get_user_balance(member_id)
+
+    async def transfer_cb_to_player(self, member: discord.Member, amount: int, reason: str):
+        if amount <= 0:
+            return False
+        if not await self.change_reserve(-amount):
+            return False
+        try:
+            user = await self.ub_get_user(member.id)
+            await user.update(cash=amount)
+            try:
+                await self.add_transaction("central_bank", f"user_{member.id}", amount, reason)
+            except Exception:
+                await user.update(cash=-amount)
+                await self.change_reserve(amount)
+                raise
+            return True
+        except Exception:
+            try:
+                await self.change_reserve(amount)
+            except Exception:
+                logger.exception("КРИТИЧНО: не удалось вернуть резерв после CB->player")
+            raise
+
+    async def transfer_player_to_cb(self, member: discord.Member, amount: int, reason: str):
+        if amount <= 0:
+            return False
+        user = await self.ub_get_user(member.id)
+        if int(getattr(user, "cash", 0) or 0) < amount:
+            return False
+        await user.update(cash=-amount)
+        try:
+            if not await self.change_reserve(amount):
+                await user.update(cash=amount)
+                return False
+            try:
+                await self.add_transaction(f"user_{member.id}", "central_bank", amount, reason)
+            except Exception:
+                await self.change_reserve(-amount)
+                await user.update(cash=amount)
+                raise
+            return True
+        except Exception:
+            logger.exception("Ошибка перевода player->CB для %s", member.id)
+            raise
 
     async def get_total_balance(self):
         if self.bot.ub_guild is None:
@@ -918,6 +983,32 @@ class CentralBankCog(commands.Cog):
         )
 
     # ----------------------------------------------------------------
+    # CB TEST TRANSFER
+    # ----------------------------------------------------------------
+
+    @commands.hybrid_command(
+        name="cb_test",
+        description="Тестовый перевод из ЦБ игроку",
+    )
+    @app_commands.describe(member="Кому выдать деньги", amount="Сумма тестового перевода")
+    @commands.has_permissions(administrator=True)
+    async def cb_test(self, ctx, member: discord.Member, amount: int = 100):
+        if amount <= 0:
+            await ctx.send("❌ Сумма должна быть положительной.")
+            return
+        try:
+            ok = await self.transfer_cb_to_player(member, amount, "Тестовый перевод ЦБ")
+        except Exception:
+            logger.exception("Ошибка cb_test")
+            await ctx.send("❌ Тест не прошёл: ошибка UnbelievaBoat или записи операции.")
+            return
+        if not ok:
+            await ctx.send("❌ В резерве ЦБ недостаточно средств.")
+            return
+        cb = await self.get_central_bank()
+        await ctx.send(f"✅ ЦБ → {member.mention}: **+{amount:,}**\n🏦 Резерв: **{int(cb.get('reserve', 0) or 0):,}**\n📜 Транзакция записана.")
+
+    # ----------------------------------------------------------------
     # CB
     # ----------------------------------------------------------------
 
@@ -1055,80 +1146,6 @@ class CentralBankCog(commands.Cog):
         )
 
         await ctx.send(embed=embed)
-
-    # ----------------------------------------------------------------
-    # TAX
-    # ----------------------------------------------------------------
-
-    @commands.hybrid_command(
-        name="tax",
-        description="Списать налог у игрока в резерв ЦБ",
-    )
-    @app_commands.describe(
-        member="Кого облагаем налогом",
-        amount="Сумма налога",
-    )
-    @commands.has_permissions(administrator=True)
-    async def tax(
-        self,
-        ctx,
-        member: discord.Member,
-        amount: int,
-    ):
-        if amount <= 0:
-            await ctx.send(
-                "❌ Сумма должна быть положительной."
-            )
-            return
-
-        if self.bot.ub_guild is None:
-            await ctx.send(
-                "❌ UnbelievaBoat недоступен."
-            )
-            return
-
-        try:
-            user = await self.bot.ub_guild.get_user_balance(
-                member.id
-            )
-
-            if user.cash < amount:
-                await ctx.send(
-                    f"❌ У {member.mention} недостаточно денег."
-                )
-                return
-
-            await user.update(cash=-amount)
-
-            try:
-                ok = await self.income_to_reserve(
-                    amount,
-                    f"user_{member.id}",
-                    "Налог",
-                )
-            except Exception:
-                await user.update(cash=amount)
-                raise
-
-            if not ok:
-                await user.update(cash=amount)
-                await ctx.send(
-                    "❌ Не удалось провести операцию. "
-                    "Средства возвращены."
-                )
-                return
-
-        except Exception as exc:
-            logger.exception("Ошибка tax: %s", exc)
-            await ctx.send(
-                "❌ Ошибка при работе с UnbelievaBoat."
-            )
-            return
-
-        await ctx.send(
-            f"💰 Налог **{amount:,}** списан у "
-            f"{member.mention}."
-        )
 
     # ----------------------------------------------------------------
     # FUNDS HELPERS
