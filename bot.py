@@ -38,7 +38,7 @@ from unbelievaboat import Client as UBClient
 # CONFIG
 # ====================================================================
 
-BOT_VERSION = "1.5.0"
+BOT_VERSION = "1.7.0"
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
 
 logging.basicConfig(
@@ -268,6 +268,7 @@ class CentralBankBot(commands.Bot):
             self.db = self.mongo_client[MONGO_DB_NAME]
             self.economy_collection = self.db["economy"]
             self.transactions_collection = self.db["transactions"]
+            self.funds_collection = self.db["funds"]
 
             logger.info(
                 "✅ MongoDB подключена | база: %s",
@@ -294,12 +295,53 @@ class CentralBankBot(commands.Bot):
                     "_id": "central_bank",
                     "reserve": 0,
                     "printed": 0,
-                    "welfare_fund": 0,
-                    "event_fund": 0,
-                    "reward_fund": 0,
                 }
             )
             logger.info("✅ Центральный банк создан")
+
+        # ------------------------------------------------------------
+        # Удаляем старые фиксированные фонды. Их остатки возвращаются
+        # в резерв ЦБ, чтобы деньги не потерялись после обновления.
+        # ------------------------------------------------------------
+        legacy = await self.economy_collection.find_one(
+            {"_id": "central_bank"}
+        ) or {}
+        legacy_total = sum(
+            int(legacy.get(key, 0) or 0)
+            for key in ("welfare_fund", "event_fund", "reward_fund")
+        )
+        if legacy_total > 0:
+            await self.economy_collection.update_one(
+                {"_id": "central_bank"},
+                {
+                    "$inc": {"reserve": legacy_total},
+                    "$unset": {
+                        "welfare_fund": "",
+                        "event_fund": "",
+                        "reward_fund": "",
+                    },
+                },
+            )
+            await self.transactions_collection.insert_one({
+                "time": datetime.now(timezone.utc),
+                "source": "legacy_funds",
+                "destination": "central_bank",
+                "amount": legacy_total,
+                "reason": "Удаление старых фиксированных фондов",
+            })
+            logger.info(
+                "♻️ Старые фонды удалены, %s возвращено в резерв ЦБ",
+                legacy_total,
+            )
+        else:
+            await self.economy_collection.update_one(
+                {"_id": "central_bank"},
+                {"$unset": {
+                    "welfare_fund": "",
+                    "event_fund": "",
+                    "reward_fund": "",
+                }},
+            )
 
         # ------------------------------------------------------------
         # UnbelievaBoat
@@ -360,8 +402,9 @@ class CentralBankBot(commands.Bot):
         if message.author.bot:
             return
 
+        # !команды требуют Message Content Intent в коде И в Developer Portal.
         if self.user and self.user in message.mentions:
-            content = message.content
+            content = message.content or ""
 
             content = content.replace(
                 f"<@{self.user.id}>",
@@ -518,10 +561,13 @@ class CentralBankCog(commands.Cog):
             name="🏛️ Управление",
             value=(
                 "`!print_money` • `/print_money` — печать\n"
+                "`!burn_money` / `/burn_money` — сжечь деньги из ЦБ\n"
                 "`!tax` • `/tax` — налог\n"
-                "`!fund` • `/fund` — фонды\n"
+                "`!fund` • `/fund` — список фондов\n"
+                "`!fund_create` • `/fund_create` — создать фонд\n"
                 "`!fund_add` • `/fund_add` — пополнить фонд\n"
-                "`!fund_take` • `/fund_take` — выдать из фонда"
+                "`!fund_take` • `/fund_take` — выдать из фонда\n"
+                "`!fund_delete` • `/fund_delete` — удалить фонд (деньги в ЦБ)"
             ),
             inline=False,
         )
@@ -690,11 +736,7 @@ class CentralBankCog(commands.Cog):
 
         reserve = int(cb.get("reserve", 0) or 0)
         printed = int(cb.get("printed", 0) or 0)
-        welfare = int(cb.get("welfare_fund", 0) or 0)
-        events = int(cb.get("event_fund", 0) or 0)
-        rewards = int(cb.get("reward_fund", 0) or 0)
-
-        funds = welfare + events + rewards
+        funds = await self.get_funds_total()
 
         total_balance = await self.get_total_balance()
         rate = await self.calculate_rate(total_balance)
@@ -765,9 +807,6 @@ class CentralBankCog(commands.Cog):
             "reserve": reserve,
             "printed": printed,
             "funds": funds,
-            "welfare": welfare,
-            "events": events,
-            "rewards": rewards,
             "total_balance": total_balance,
             "total_economy": (
                 reserve + funds + total_balance
@@ -838,6 +877,47 @@ class CentralBankCog(commands.Cog):
         )
 
     # ----------------------------------------------------------------
+    # BURN MONEY
+    # ----------------------------------------------------------------
+
+    @commands.hybrid_command(
+        name="burn_money",
+        aliases=["burn"],
+        description="Сжечь деньги из резерва ЦБ",
+    )
+    @app_commands.describe(amount="Сколько денег сжечь", reason="Причина сжигания")
+    @commands.has_permissions(administrator=True)
+    async def burn_money(self, ctx, amount: int, reason: str = "Сжигание денег"):
+        if amount <= 0:
+            await ctx.send("❌ Сумма должна быть положительной.")
+            return
+        reason = (reason or "Сжигание денег").strip()
+        if len(reason) > 200:
+            await ctx.send("❌ Причина — максимум 200 символов.")
+            return
+        cb = await self.get_central_bank()
+        reserve = int(cb.get("reserve", 0) or 0)
+        if amount > reserve:
+            await ctx.send(f"❌ В резерве ЦБ недостаточно денег. Сейчас: **{reserve:,}**.")
+            return
+        if not await self.change_reserve(-amount):
+            await ctx.send("❌ Не удалось сжечь деньги.")
+            return
+        try:
+            await self.add_transaction("central_bank", "burned_money", amount, reason)
+        except Exception as exc:
+            await self.change_reserve(amount)
+            logger.exception("Ошибка записи сжигания: %s", exc)
+            await ctx.send("❌ Не удалось записать операцию. Деньги возвращены в резерв.")
+            return
+        cb = await self.get_central_bank()
+        await ctx.send(
+            f"🔥 Сожжено: **{amount:,}**\n"
+            f"🏦 Остаток резерва ЦБ: **{int(cb.get('reserve', 0) or 0):,}**\n"
+            f"📝 Причина: {reason}"
+        )
+
+    # ----------------------------------------------------------------
     # CB
     # ----------------------------------------------------------------
 
@@ -859,11 +939,7 @@ class CentralBankCog(commands.Cog):
 
         reserve = int(cb.get("reserve", 0) or 0)
 
-        funds = (
-            int(cb.get("welfare_fund", 0) or 0)
-            + int(cb.get("event_fund", 0) or 0)
-            + int(cb.get("reward_fund", 0) or 0)
-        )
+        funds = await self.get_funds_total()
 
         total_economy = reserve + funds + total
 
@@ -897,22 +973,6 @@ class CentralBankCog(commands.Cog):
             value=f"{cb.get('printed', 0):,}",
             inline=False,
         )
-        embed.add_field(
-            name="🤝 Соцфонд",
-            value=f"{cb.get('welfare_fund', 0):,}",
-            inline=True,
-        )
-        embed.add_field(
-            name="🎉 Ивенты",
-            value=f"{cb.get('event_fund', 0):,}",
-            inline=True,
-        )
-        embed.add_field(
-            name="🎁 Награды",
-            value=f"{cb.get('reward_fund', 0):,}",
-            inline=True,
-        )
-
         await ctx.send(embed=embed)
 
     # ----------------------------------------------------------------
@@ -1071,64 +1131,132 @@ class CentralBankCog(commands.Cog):
         )
 
     # ----------------------------------------------------------------
+    # FUNDS HELPERS
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def normalize_fund_name(name: str) -> str:
+        name = re.sub(r"\s+", " ", (name or "").strip().lower())
+        return name
+
+    async def get_funds(self):
+        return await self.bot.funds_collection.find(
+            {}
+        ).sort("name", 1).to_list(1000)
+
+    async def get_fund(self, name: str):
+        name = self.normalize_fund_name(name)
+        return await self.bot.funds_collection.find_one({"_id": name})
+
+    async def get_funds_total(self):
+        result = await self.bot.funds_collection.aggregate([
+            {"$group": {"_id": None, "total": {"$sum": "$balance"}}}
+        ]).to_list(1)
+        return int(result[0].get("total", 0) or 0) if result else 0
+
+    # ----------------------------------------------------------------
     # FUND
     # ----------------------------------------------------------------
 
     @commands.hybrid_command(
         name="fund",
-        description="Показать состояние фондов",
+        description="Показать все фонды",
     )
     @app_commands.describe(
-        fund_name="welfare, event, reward или all"
+        fund_name="Название фонда или оставь пустым для списка"
     )
     async def fund(
         self,
         ctx,
-        fund_name: str = "all",
+        fund_name: str = "",
     ):
-        fund_name = fund_name.lower().strip()
-        cb = await self.get_central_bank()
+        fund_name = self.normalize_fund_name(fund_name)
 
-        if fund_name == "all":
-            embed = discord.Embed(
-                title="🏛️ Фонды",
-                color=0x00BFFF,
-            )
+        if fund_name:
+            document = await self.get_fund(fund_name)
+            if document is None:
+                await ctx.send(f"❌ Фонд **{fund_name}** не найден.")
+                return
 
-            embed.add_field(
-                name="🤝 Соцфонд",
-                value=f"{cb.get('welfare_fund', 0):,}",
-                inline=True,
+            description = document.get("description", "")
+            text = (
+                f"🏛️ Фонд **{document['name']}**\n"
+                f"💰 Баланс: **{int(document.get('balance', 0) or 0):,}**"
             )
-            embed.add_field(
-                name="🎉 Ивенты",
-                value=f"{cb.get('event_fund', 0):,}",
-                inline=True,
-            )
-            embed.add_field(
-                name="🎁 Награды",
-                value=f"{cb.get('reward_fund', 0):,}",
-                inline=True,
-            )
-
-            await ctx.send(embed=embed)
+            if description:
+                text += f"\n📝 Назначение: {description}"
+            await ctx.send(text)
             return
 
-        fmap = {
-            "welfare": "welfare_fund",
-            "event": "event_fund",
-            "reward": "reward_fund",
-        }
-
-        if fund_name not in fmap:
-            await ctx.send(
-                "❌ Доступно: welfare, event, reward"
-            )
+        documents = await self.get_funds()
+        if not documents:
+            await ctx.send("🏛️ Фондов пока нет.")
             return
+
+        lines = []
+        for document in documents:
+            lines.append(
+                f"• **{document['name']}** — "
+                f"{int(document.get('balance', 0) or 0):,}"
+                + (f" — {document.get('description')}" if document.get('description') else "")
+            )
+
+        embed = discord.Embed(
+            title="🏛️ Фонды Центрального банка",
+            description="\n".join(lines)[:4096],
+            color=0x00BFFF,
+        )
+        embed.set_footer(text=f"Всего фондов: {len(documents)}")
+        await ctx.send(embed=embed)
+
+    # ----------------------------------------------------------------
+    # FUND CREATE
+    # ----------------------------------------------------------------
+
+    @commands.hybrid_command(
+        name="fund_create",
+        description="Создать фонд под определённое действие",
+    )
+    @app_commands.describe(
+        fund_name="Название нового фонда",
+        description="Для чего используется фонд",
+    )
+    @commands.has_permissions(administrator=True)
+    async def fund_create(
+        self,
+        ctx,
+        fund_name: str,
+        description: str = "",
+    ):
+        fund_name = self.normalize_fund_name(fund_name)
+        description = (description or "").strip()
+
+        if len(fund_name) < 2 or len(fund_name) > 32:
+            await ctx.send("❌ Название фонда должно быть от 2 до 32 символов.")
+            return
+
+        if len(description) > 200:
+            await ctx.send("❌ Описание фонда — максимум 200 символов.")
+            return
+
+        existing = await self.get_fund(fund_name)
+        if existing is not None:
+            await ctx.send(f"❌ Фонд **{fund_name}** уже существует.")
+            return
+
+        await self.bot.funds_collection.insert_one({
+            "_id": fund_name,
+            "name": fund_name,
+            "description": description,
+            "balance": 0,
+            "created_at": datetime.now(timezone.utc),
+            "created_by": ctx.author.id,
+        })
 
         await ctx.send(
-            f"🏛️ {fund_name}: "
-            f"**{cb.get(fmap[fund_name], 0):,}**"
+            f"✅ Фонд **{fund_name}** создан.\n"
+            f"💰 Баланс: **0**"
+            + (f"\n📝 Назначение: {description}" if description else "")
         )
 
     # ----------------------------------------------------------------
@@ -1140,7 +1268,7 @@ class CentralBankCog(commands.Cog):
         description="Пополнить фонд из резерва ЦБ",
     )
     @app_commands.describe(
-        fund_name="welfare, event или reward",
+        fund_name="Название фонда",
         amount="Сумма пополнения",
     )
     @commands.has_permissions(administrator=True)
@@ -1150,55 +1278,48 @@ class CentralBankCog(commands.Cog):
         fund_name: str,
         amount: int,
     ):
-        fund_name = fund_name.lower().strip()
+        fund_name = self.normalize_fund_name(fund_name)
 
         if amount <= 0:
-            await ctx.send(
-                "❌ Сумма должна быть положительной."
-            )
+            await ctx.send("❌ Сумма должна быть положительной.")
             return
 
-        fmap = {
-            "welfare": "welfare_fund",
-            "event": "event_fund",
-            "reward": "reward_fund",
-        }
-
-        if fund_name not in fmap:
-            await ctx.send(
-                "❌ Доступно: welfare, event, reward"
-            )
+        if await self.get_fund(fund_name) is None:
+            await ctx.send(f"❌ Фонд **{fund_name}** не найден.")
             return
 
-        if not await self.spend_from_reserve(
-            amount,
-            f"fund_{fund_name}",
-            f"Пополнение {fund_name}",
-        ):
-            await ctx.send(
-                "❌ В ЦБ недостаточно средств."
-            )
+        if not await self.change_reserve(-amount):
+            await ctx.send("❌ В ЦБ недостаточно средств.")
             return
 
+        fund_changed = False
         try:
-            await self.bot.economy_collection.update_one(
-                {"_id": "central_bank"},
-                {"$inc": {fmap[fund_name]: amount}},
+            result = await self.bot.funds_collection.update_one(
+                {"_id": fund_name},
+                {"$inc": {"balance": amount}},
+            )
+            if result.modified_count != 1:
+                raise RuntimeError("Фонд исчез во время пополнения")
+            fund_changed = True
+            await self.add_transaction(
+                "central_bank", f"fund:{fund_name}", amount,
+                f"Пополнение фонда {fund_name}",
             )
         except Exception as exc:
             await self.change_reserve(amount)
-            logger.exception(
-                "Ошибка пополнения фонда: %s",
-                exc,
-            )
-            await ctx.send(
-                "❌ Ошибка MongoDB. Средства возвращены в резерв."
-            )
+            if fund_changed:
+                try:
+                    await self.bot.funds_collection.update_one(
+                        {"_id": fund_name, "balance": {"$gte": amount}},
+                        {"$inc": {"balance": -amount}},
+                    )
+                except Exception:
+                    logger.exception("Не удалось откатить пополнение фонда")
+            logger.exception("Ошибка пополнения фонда: %s", exc)
+            await ctx.send("❌ Ошибка операции. Средства возвращены в резерв ЦБ.")
             return
 
-        await ctx.send(
-            f"✅ +{amount:,} в фонд **{fund_name}**"
-        )
+        await ctx.send(f"✅ В фонд **{fund_name}** добавлено **{amount:,}**.")
 
     # ----------------------------------------------------------------
     # FUND TAKE
@@ -1209,7 +1330,7 @@ class CentralBankCog(commands.Cog):
         description="Выдать деньги игроку из фонда",
     )
     @app_commands.describe(
-        fund_name="welfare, event или reward",
+        fund_name="Название фонда",
         amount="Сумма выдачи",
         member="Кому выдать",
     )
@@ -1221,78 +1342,150 @@ class CentralBankCog(commands.Cog):
         amount: int,
         member: discord.Member,
     ):
-        fund_name = fund_name.lower().strip()
+        fund_name = self.normalize_fund_name(fund_name)
 
         if amount <= 0:
-            await ctx.send(
-                "❌ Сумма должна быть положительной."
-            )
+            await ctx.send("❌ Сумма должна быть положительной.")
             return
 
-        fmap = {
-            "welfare": "welfare_fund",
-            "event": "event_fund",
-            "reward": "reward_fund",
-        }
-
-        if fund_name not in fmap:
-            await ctx.send(
-                "❌ Доступно: welfare, event, reward"
-            )
+        if await self.get_fund(fund_name) is None:
+            await ctx.send(f"❌ Фонд **{fund_name}** не найден.")
             return
 
-        result = await self.bot.economy_collection.update_one(
-            {
-                "_id": "central_bank",
-                fmap[fund_name]: {"$gte": amount},
-            },
-            {
-                "$inc": {
-                    fmap[fund_name]: -amount
-                }
-            },
+        result = await self.bot.funds_collection.update_one(
+            {"_id": fund_name, "balance": {"$gte": amount}},
+            {"$inc": {"balance": -amount}},
         )
 
         if result.modified_count != 1:
-            await ctx.send(
-                "❌ В фонде недостаточно средств."
-            )
+            await ctx.send("❌ В фонде недостаточно средств.")
             return
 
         try:
-            user = await self.bot.ub_guild.get_user_balance(
-                member.id
-            )
+            user = await self.bot.ub_guild.get_user_balance(member.id)
             await user.update(cash=amount)
-
         except Exception as exc:
-            await self.bot.economy_collection.update_one(
-                {"_id": "central_bank"},
-                {"$inc": {fmap[fund_name]: amount}},
+            await self.bot.funds_collection.update_one(
+                {"_id": fund_name},
+                {"$inc": {"balance": amount}},
             )
-
-            logger.exception(
-                "Ошибка fund_take: %s",
-                exc,
-            )
-
-            await ctx.send(
-                "❌ Не удалось выдать деньги. "
-                "Средства возвращены в фонд."
-            )
+            logger.exception("Ошибка fund_take: %s", exc)
+            await ctx.send("❌ Не удалось выдать деньги. Средства возвращены в фонд.")
             return
 
-        await self.add_transaction(
-            f"fund_{fund_name}",
-            f"user_{member.id}",
-            amount,
-            f"Выдача из {fund_name}",
-        )
+        try:
+            await self.add_transaction(
+                f"fund:{fund_name}",
+                f"user_{member.id}",
+                amount,
+                f"Выдача из фонда {fund_name}",
+            )
+        except Exception as exc:
+            try:
+                await user.update(cash=-amount)
+            except Exception:
+                logger.exception("Не удалось откатить деньги игроку после fund_take")
+            await self.bot.funds_collection.update_one(
+                {"_id": fund_name},
+                {"$inc": {"balance": amount}},
+            )
+            logger.exception("Ошибка записи fund_take: %s", exc)
+            await ctx.send("❌ Не удалось записать операцию. Деньги возвращены в фонд.")
+            return
 
         await ctx.send(
-            f"✅ {member.mention} получил **{amount:,}** "
-            f"из фонда {fund_name}."
+            f"✅ {member.mention} получил **{amount:,}** из фонда **{fund_name}**."
         )
+
+    # ----------------------------------------------------------------
+    # FUND DELETE
+    # ----------------------------------------------------------------
+
+    @commands.hybrid_command(
+        name="fund_delete",
+        description="Удалить фонд и вернуть его деньги в ЦБ",
+    )
+    @app_commands.describe(
+        fund_name="Название фонда для удаления",
+    )
+    @commands.has_permissions(administrator=True)
+    async def fund_delete(
+        self,
+        ctx,
+        fund_name: str,
+    ):
+        fund_name = self.normalize_fund_name(fund_name)
+
+        document = await self.get_fund(fund_name)
+
+        if document is None:
+            await ctx.send(f"❌ Фонд **{fund_name}** не найден.")
+            return
+
+        balance = int(document.get("balance", 0) or 0)
+
+        if balance > 0 and not await self.change_reserve(balance):
+            await ctx.send("❌ Не удалось вернуть деньги в ЦБ. Фонд не удалён.")
+            return
+
+        deleted = False
+        try:
+            result = await self.bot.funds_collection.delete_one({"_id": fund_name})
+            if result.deleted_count != 1:
+                raise RuntimeError("Фонд уже изменился или был удалён")
+            deleted = True
+            if balance > 0:
+                await self.add_transaction(
+                    f"fund:{fund_name}", "central_bank", balance,
+                    f"Удаление фонда {fund_name}",
+                )
+        except Exception as exc:
+            if deleted:
+                try:
+                    await self.bot.funds_collection.replace_one(
+                        {"_id": fund_name}, document, upsert=True
+                    )
+                except Exception:
+                    logger.exception("Не удалось восстановить фонд после ошибки")
+            if balance > 0:
+                await self.change_reserve(-balance)
+            logger.exception("Ошибка удаления фонда: %s", exc)
+            await ctx.send("❌ Ошибка удаления. Фонд восстановлен.")
+            return
+
+        await ctx.send(
+            f"🗑️ Фонд **{fund_name}** удалён.\n"
+            f"🏦 В резерв ЦБ возвращено: **{balance:,}**"
+        )
+    # ----------------------------------------------------------------
+    # AUDIT
+    # ----------------------------------------------------------------
+
+    @commands.hybrid_command(
+        name="audit",
+        description="Проверить состояние экономики и фондов",
+    )
+    @commands.has_permissions(administrator=True)
+    async def audit(self, ctx):
+        try:
+            cb = await self.get_central_bank()
+            reserve = int(cb.get("reserve", 0) or 0)
+            funds = await self.get_funds_total()
+            players = await self.get_total_balance()
+            tx_count = await self.bot.transactions_collection.count_documents({})
+
+            embed = discord.Embed(title="🔎 Аудит экономики", color=0x00BFFF)
+            embed.add_field(name="🏦 Резерв ЦБ", value=f"**{reserve:,}**", inline=True)
+            embed.add_field(name="🏛️ Фонды", value=f"**{funds:,}**", inline=True)
+            embed.add_field(name="👥 У игроков", value=f"**{players:,}**", inline=True)
+            embed.add_field(name="💰 Учтено всего", value=f"**{reserve + funds + players:,}**", inline=False)
+            embed.add_field(name="📜 Транзакций", value=f"**{tx_count:,}**", inline=False)
+            embed.add_field(name="🖨️ Напечатано", value=f"**{int(cb.get('printed', 0) or 0):,}**", inline=False)
+            embed.set_footer(text="Аудит не изменяет баланс.")
+            await ctx.send(embed=embed)
+        except Exception as exc:
+            logger.exception("Ошибка audit: %s", exc)
+            await ctx.send("❌ Не удалось выполнить аудит.")
 
     # ----------------------------------------------------------------
     # RATE
@@ -1469,11 +1662,12 @@ class CentralBankCog(commands.Cog):
                 "%d.%m %H:%M"
             )
 
-            sign = (
-                "+"
-                if document["destination"] == "central_bank"
-                else "-"
-            )
+            if document["destination"] == "central_bank":
+                sign = "+"
+            elif document["destination"] == "burned_money":
+                sign = "🔥"
+            else:
+                sign = "-"
 
             lines.append(
                 f"`{timestamp}` "
