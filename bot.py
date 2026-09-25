@@ -500,19 +500,33 @@ class Bot(commands.Bot):
         for v in root.findall("Valute"):
             code = v.findtext("CharCode")
             value = v.findtext("Value")
+            nominal = v.findtext("Nominal") or "1"
             if code and value:
-                c[code] = float(value.replace(",", "."))
+                rub_value = float(value.replace(",", "."))
+                nominal_value = float(nominal.replace(",", "."))
+                c[code] = rub_value / nominal_value if nominal_value else 0
+
         import math
         internal = round(1000 / math.sqrt(1 + max(0, s["supply"]) / 100000), 2)
-        return {"internal": internal, "usd": round(c.get("USD", 0), 4), "eur": round(c.get("EUR", 0), 4),
-                "cny": round(c.get("CNY", 0), 4), "supply": s["supply"], "created_at": now()}
+        usd_rub = c.get("USD", 0)
+        eur_rub = c.get("EUR", 0)
+        cny_rub = c.get("CNY", 0)
+
+        return {
+            "internal": internal,
+            "coin_usd": round(internal / usd_rub, 4) if usd_rub else 0,
+            "coin_eur": round(internal / eur_rub, 4) if eur_rub else 0,
+            "coin_cny": round(internal / cny_rub, 4) if cny_rub else 0,
+            "supply": s["supply"],
+            "created_at": now(),
+        }
 
     async def ai_report(self, s):
         if not self.hf:
             return None
         prompt = ("Коротко (2-4 предложения) опиши экономический отчёт Discord-ЦБ на русском, "
                   "без выдумок и причин, которых нет в данных. "
-                  f"Резерв {s['reserve']}; фонды {s['funds']}; игроки {s['players']}; "
+                  f"Резерв {s['reserve']}; фонды {s['funds']}; "
                   f"масса {s['supply']}; напечатано {s['printed']}; приход24ч {s['incoming']}; расход24ч {s['outgoing']}.")
         try:
             x = await asyncio.to_thread(self.hf.chat_completion, messages=[{"role": "user", "content": prompt}],
@@ -619,9 +633,11 @@ class Bot(commands.Bot):
                 s = await self.stats(); r = await self.rate()
                 e = discord.Embed(title="📊 Ежедневный отчёт ЦБ", description=(
                     f"Резерв: `{fmt(s['reserve'])}`\nФонды: `{fmt(s['funds'])}`\n"
-                    f"Игроки: `{fmt(s['players'])}`\nДенежная масса: `{fmt(s['supply'])}`\n"
+                    f"Денежная масса: `{fmt(s['supply'])}`\n"
                     f"Напечатано: `{fmt(s['printed'])}`\n\nВнутренний курс: `{r['internal']}`\n"
-                    f"USD: `{r['usd']}` RUB\nEUR: `{r['eur']}` RUB\nCNY: `{r['cny']}` RUB"), timestamp=now())
+                    f"1 монета ≈ `{r['coin_usd']}` $\n"
+                    f"1 монета ≈ `{r['coin_eur']}` €\n"
+                    f"1 монета ≈ `{r['coin_cny']}` ¥"), timestamp=now())
                 ai = await self.ai_report(s)
                 if ai: e.add_field(name="🤖 Анализ", value=ai[:1024], inline=False)
                 ch = self.get_channel(REPORT_CHANNEL_ID) or await self.fetch_channel(REPORT_CHANNEL_ID)
@@ -674,7 +690,7 @@ class Cog(commands.Cog):
         try:
             s = await self.bot.stats()
             await ctx.send(f"📈 **Экономика**\nРезерв `{fmt(s['reserve'])}` | Фонды `{fmt(s['funds'])}` | "
-                           f"Игроки `{fmt(s['players'])}` | Масса `{fmt(s['supply'])}`\n"
+                           f"Масса `{fmt(s['supply'])}`\n"
                            f"24ч: приход `{fmt(s['incoming'])}` / расход `{fmt(s['outgoing'])}`\n"
                            f"Напечатано всего: `{fmt(s['printed'])}`")
         except Exception as e:
@@ -776,7 +792,7 @@ class Cog(commands.Cog):
         await ctx.defer()
         try:
             s = await self.bot.stats(); tx = await self.bot.tx.count_documents({})
-            await ctx.send(f"🔎 **Аудит**\nИгроки `{fmt(s['players'])}` + резерв `{fmt(s['reserve'])}` + фонды `{fmt(s['funds'])}` = `{fmt(s['supply'])}`\n"
+            await ctx.send(f"🔎 **Аудит**\nРезерв `{fmt(s['reserve'])}` + фонды `{fmt(s['funds'])}` + обращение = `{fmt(s['supply'])}`\n"
                            f"Напечатано `{fmt(s['printed'])}` | операций `{tx}`\nСтатус: ✅ баланс сходится")
         except Exception as e: await ctx.send(f"❌ Ошибка: `{str(e)[:500]}`")
 
@@ -785,7 +801,11 @@ class Cog(commands.Cog):
         await ctx.defer()
         try:
             r = await self.bot.rate(); await self.bot.rates.insert_one(r)
-            await ctx.send(f"💱 **Курс**\nВнутренний: `{r['internal']}`\nUSD `{r['usd']}` RUB | EUR `{r['eur']}` RUB | CNY `{r['cny']}` RUB\nМасса `{fmt(r['supply'])}`")
+            await ctx.send(f"💱 **Курс**\nВнутренний: `{r['internal']}`\n"
+                           f"1 монета ≈ `{r['coin_usd']}` $\n"
+                           f"1 монета ≈ `{r['coin_eur']}` €\n"
+                           f"1 монета ≈ `{r['coin_cny']}` ¥\n"
+                           f"Масса `{fmt(r['supply'])}`")
         except Exception as e: await ctx.send(f"❌ Ошибка: `{str(e)[:500]}`")
 
     @commands.hybrid_command(name="chart", description="График курса")
