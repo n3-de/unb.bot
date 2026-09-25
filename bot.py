@@ -23,7 +23,7 @@ try:
 except Exception:
     InferenceClient = None
 
-BOT_VERSION = "1.9.2"
+BOT_VERSION = "1.9.4"
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 UB_TOKEN = os.getenv("UB_TOKEN")
@@ -39,6 +39,25 @@ REPORT_HOUR_UTC = 18
 # Баланс игроков контролируется через UnbelievaBoat Dashboard.
 # Бот не дублирует команды work/crime/beg/daily/etc.
 SYNC_INTERVAL_MINUTES = 1
+
+# Настройки доходных команд нашего бота.
+# Это теперь НЕ команды UnbelievaBoat: UB должен быть отключён для этих команд.
+WORK_MIN, WORK_MAX = 20, 250
+SLUT_MIN, SLUT_MAX = 100, 400
+CRIME_MIN, CRIME_MAX = 250, 700
+CRIME_FAIL_RATE = 60
+SLUT_FAIL_RATE = 35
+FINE_MIN_PERCENT, FINE_MAX_PERCENT = 20, 40
+ROB_COOLDOWN = 86400
+WORK_COOLDOWN = 4 * 3600
+SLUT_COOLDOWN = 4 * 3600
+CRIME_COOLDOWN = 4 * 3600
+
+# Казино: ставка идёт от игрока в ЦБ, выигрыш — из ЦБ игроку.
+CASINO_MIN_BET = 1
+CASINO_MAX_BET = 100000
+GAME_COOLDOWN = 30
+SLOT_PAYOUTS = {"🍒🍒🍒": 8, "🍋🍋🍋": 10, "🔔🔔🔔": 15, "💎💎💎": 25}
 
 UB_BASE = "https://unbelievaboat.com/api/v1"
 
@@ -427,6 +446,34 @@ class Bot(commands.Bot):
                 await self.change_reserve(-amount)
             raise
 
+    async def user_cash(self, uid: int):
+        user = await self.ub.user(uid)
+        if not isinstance(user, dict):
+            return 0
+        return int(user.get("cash", 0) or 0)
+
+    async def casino_bet(self, member, amount: int):
+        # Игрок -> ЦБ. Ставка становится доходом казино/ЦБ.
+        return await self.player_to_cb(member, amount, "Ставка казино",)
+
+    async def casino_payout(self, member, amount: int, reason: str):
+        # ЦБ -> игрок.
+        return await self.cb_to_player(member, amount, reason, meta={"type": "casino_payout"})
+
+    async def payout_random(self, member, minimum, maximum, reason, command_name):
+        amount = random.randint(minimum, maximum)
+        ok = await self.pay_player(member, amount, reason, command_name)
+        return ok, amount
+
+    async def fine_percent(self, member, minimum_pct, maximum_pct, reason):
+        cash = await self.user_cash(member.id)
+        pct = random.randint(minimum_pct, maximum_pct)
+        fine = max(1, int(cash * pct / 100)) if cash else 0
+        if fine:
+            ok = await self.player_to_cb(member, fine, reason)
+            return ok, fine, pct
+        return True, 0, pct
+
     async def stats(self):
         r, f, p, pr = await asyncio.gather(self.reserve(), self.funds_total(), self.ub.total(), self.printed())
         since = now() - timedelta(hours=24)
@@ -605,11 +652,10 @@ class Cog(commands.Cog):
     @commands.hybrid_command(name="help", description="Команды Центрального банка")
     async def help(self, ctx):
         await ctx.send("🏦 **ЦБ**\n`!cb` `!economy` `!rate` `!chart` `!history` `!audit`\n"
-                       ""
                        "`!print_money` `!burn_money` `!cb_test`\n"
                        "`!fund` `!fund_create` `!fund_add` `!fund_take` `!fund_delete`\n\n"
-                       "Налоговой команды нет. Заработки выше проходят через ЦБ. "
-                       "Отключи/переименуй одноимённые команды UB, чтобы не было двойной выплаты.")
+                       "💡 UnbelievaBoat остаётся игровой экономикой сервера. ЦБ автоматически учитывает "
+                       "изменения балансов игроков и корректирует свой резерв. Свои work/crime/казино ЦБ не подменяет.")
 
     @commands.hybrid_command(name="cb", description="Состояние Центрального банка")
     async def cb(self, ctx):
@@ -617,7 +663,7 @@ class Cog(commands.Cog):
         try:
             s = await self.bot.stats()
             await ctx.send(f"🏦 **ЦБ**\nРезерв: `{fmt(s['reserve'])}`\nФонды: `{fmt(s['funds'])}`\n"
-                           f"Игроки: `{fmt(s['players'])}`\nВсего денег: `{fmt(s['supply'])}`\n"
+                           f"Всего в системе: `{fmt(s['supply'])}`\n"
                            f"Напечатано: `{fmt(s['printed'])}`")
         except Exception as e:
             await ctx.send(f"❌ Ошибка: `{str(e)[:500]}`")
