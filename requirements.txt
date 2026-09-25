@@ -1,5 +1,4 @@
 discord.py
-unbelievaboat==1.2.3
 motor
 huggingface_hub
 requests
