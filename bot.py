@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import random
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
@@ -22,7 +23,7 @@ try:
 except Exception:
     InferenceClient = None
 
-BOT_VERSION = "1.9.1"
+BOT_VERSION = "1.9.2"
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 UB_TOKEN = os.getenv("UB_TOKEN")
@@ -34,6 +35,11 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 REPORT_CHANNEL_ID = int(os.getenv("REPORT_CHANNEL_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
 REPORT_HOUR_UTC = 18
+
+# Баланс игроков контролируется через UnbelievaBoat Dashboard.
+# Бот не дублирует команды work/crime/beg/daily/etc.
+SYNC_INTERVAL_MINUTES = 1
+
 UB_BASE = "https://unbelievaboat.com/api/v1"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -163,6 +169,8 @@ class Bot(commands.Bot):
         self.ub: Optional[UB] = None
         self.hf = None
         self.synced = False
+        self.balance_snapshot = {}
+        self.expected_balance_changes = {}
 
     async def setup_hook(self):
         self.mongo = AsyncIOMotorClient(mongo_uri(), serverSelectionTimeoutMS=10000)
@@ -198,6 +206,7 @@ class Bot(commands.Bot):
 
         self.report_loop.start()
         self.cleanup_loop.start()
+        self.ub_sync_loop.start()
 
     async def on_ready(self):
         log.info("Бот онлайн: %s", self.user)
@@ -211,7 +220,7 @@ class Bot(commands.Bot):
                 log.exception("Fallback sync failed")
 
     async def close(self):
-        for t in (self.report_loop, self.cleanup_loop):
+        for t in (self.report_loop, self.cleanup_loop, self.ub_sync_loop):
             if t.is_running():
                 t.cancel()
         if self.ub:
@@ -233,6 +242,13 @@ class Bot(commands.Bot):
             return await ctx.send(f"❌ Не хватает аргумента: `{error.param.name}`")
         if isinstance(error, commands.BadArgument):
             return await ctx.send("❌ Неверный формат аргумента.")
+        if isinstance(error, commands.CommandOnCooldown):
+            seconds = int(error.retry_after)
+            if seconds >= 86400: text = f"{seconds // 86400} дн."
+            elif seconds >= 3600: text = f"{seconds // 3600} ч."
+            elif seconds >= 60: text = f"{seconds // 60} мин."
+            else: text = f"{seconds} сек."
+            return await ctx.send(f"⏳ Попробуй снова через `{text}`.")
         log.exception("Command error", exc_info=error)
         await ctx.send(f"❌ Ошибка: `{str(error)[:500]}`")
 
@@ -288,13 +304,14 @@ class Bot(commands.Bot):
             raise
 
     # ---------------- Transfers ----------------
-    async def cb_to_player(self, member, amount, reason):
+    async def cb_to_player(self, member, amount, reason, meta=None):
         if amount <= 0 or not await self.change_reserve(-amount):
             return False
         try:
             await self.ub.change_cash(member.id, amount, reason)
+            self.expect_balance_change(member.id, amount)
             try:
-                await self.journal("central_bank", f"user_{member.id}", amount, reason)
+                await self.journal("central_bank", f"user_{member.id}", amount, reason, meta=meta)
             except Exception:
                 await self.ub.change_cash(member.id, -amount, "Rollback: journal error")
                 await self.change_reserve(amount)
@@ -303,6 +320,15 @@ class Bot(commands.Bot):
         except Exception:
             await self.change_reserve(amount)
             raise
+
+    async def pay_player(self, member, amount, reason, command_name):
+        """Единая точка выплат игрокам из бюджета ЦБ."""
+        if amount <= 0:
+            return False
+        return await self.cb_to_player(
+            member, amount, reason,
+            meta={"type": "player_earning", "command": command_name},
+        )
 
     async def player_to_cb(self, member, amount, reason):
         if amount <= 0:
@@ -314,6 +340,7 @@ class Bot(commands.Bot):
         if cash < amount:
             return False
         await self.ub.change_cash(member.id, -amount, reason)
+        self.expect_balance_change(member.id, -amount)
         try:
             if not await self.change_reserve(amount):
                 await self.ub.change_cash(member.id, amount, "Rollback: CB reserve error")
@@ -371,6 +398,7 @@ class Bot(commands.Bot):
             return False
         try:
             await self.ub.change_cash(member.id, amount, reason)
+            self.expect_balance_change(member.id, amount)
             try:
                 await self.journal(f"fund_{name}", f"user_{member.id}", amount, reason)
             except Exception:
@@ -447,6 +475,95 @@ class Bot(commands.Bot):
             log.exception("HF report failed")
             return None
 
+    def expect_balance_change(self, user_id: int, delta: int):
+        self.expected_balance_changes[user_id] = self.expected_balance_changes.get(user_id, 0) + int(delta)
+
+    @tasks.loop(minutes=1)
+    async def ub_sync_loop(self):
+        """Синхронизирует изменения балансов, сделанные командами/дашбордом UB.
+
+        Бот не реализует work/crime/beg/daily и т.п. сам. Если UB увеличил баланс
+        игрока через свою настройку/команду, рост считается расходом ЦБ.
+        Контролируемые самим ботом переводы помечаются как ожидаемые и не списываются повторно.
+        """
+        try:
+            rows = await self.ub.users()
+            current = {}
+            for x in rows:
+                if not isinstance(x, dict):
+                    continue
+                uid = int(x.get("user_id", x.get("id", 0)) or 0)
+                if not uid:
+                    continue
+                current[uid] = int(x.get("cash", 0) or 0) + int(x.get("bank", 0) or 0)
+
+            if not self.balance_snapshot:
+                self.balance_snapshot = current
+                log.info("UB balance snapshot initialized: %d users", len(current))
+                return
+
+            for uid, new_total in current.items():
+                old_total = self.balance_snapshot.get(uid)
+                if old_total is None:
+                    self.balance_snapshot[uid] = new_total
+                    continue
+                delta = new_total - old_total
+                if delta == 0:
+                    continue
+
+                expected = self.expected_balance_changes.get(uid, 0)
+                if expected:
+                    consumed = min(abs(expected), abs(delta)) * (1 if expected * delta > 0 else 0)
+                    if consumed:
+                        expected -= consumed if expected > 0 else -consumed
+                        delta -= consumed if delta > 0 else -consumed
+                        if expected:
+                            self.expected_balance_changes[uid] = expected
+                        else:
+                            self.expected_balance_changes.pop(uid, None)
+                    # Если направление не совпало, оставляем изменение для учёта ниже.
+
+                if delta > 0:
+                    # Любая внешняя выдача денег игроку (в том числе UB work/crime/etc.)
+                    # финансируется резервом ЦБ.
+                    ok = await self.change_reserve(-delta)
+                    if ok:
+                        await self.journal(
+                            "unbelievaboat", f"user_{uid}", delta,
+                            "Выплата через UnbelievaBoat",
+                            meta={"type": "ub_external_earning", "user_id": uid},
+                        )
+                        log.info("UB -> user %s: +%s; CB reserve -%s", uid, delta, delta)
+                    else:
+                        # В ЦБ не хватило денег — откатываем обнаруженное увеличение.
+                        try:
+                            await self.ub.change_cash(uid, -delta, "Rollback: insufficient Central Bank reserve")
+                            await self.journal(
+                                "central_bank", f"user_{uid}", 0,
+                                "Отклонена выплата UB: недостаточно средств ЦБ",
+                                meta={"type": "ub_external_earning_rejected", "user_id": uid, "amount": delta},
+                            )
+                        except Exception:
+                            log.exception("Could not rollback external UB earning for %s", uid)
+                else:
+                    # Уменьшение баланса игрока — деньги вернулись из обращения.
+                    amount = -delta
+                    await self.change_reserve(amount)
+                    await self.journal(
+                        f"user_{uid}", "central_bank", amount,
+                        "Списание/возврат денег через UnbelievaBoat",
+                        meta={"type": "ub_external_decrease", "user_id": uid},
+                    )
+                    log.info("user %s -> CB: +%s", uid, amount)
+
+            self.balance_snapshot = current
+        except Exception:
+            log.exception("UB balance sync failed")
+
+    @ub_sync_loop.before_loop
+    async def before_ub_sync(self):
+        await self.wait_until_ready()
+
     @tasks.loop(minutes=1)
     async def report_loop(self):
         t = now()
@@ -488,9 +605,11 @@ class Cog(commands.Cog):
     @commands.hybrid_command(name="help", description="Команды Центрального банка")
     async def help(self, ctx):
         await ctx.send("🏦 **ЦБ**\n`!cb` `!economy` `!rate` `!chart` `!history` `!audit`\n"
+                       ""
                        "`!print_money` `!burn_money` `!cb_test`\n"
                        "`!fund` `!fund_create` `!fund_add` `!fund_take` `!fund_delete`\n\n"
-                       "Налоговой команды нет. Нативный `!work` UB ЦБ автоматически не видит.")
+                       "Налоговой команды нет. Заработки выше проходят через ЦБ. "
+                       "Отключи/переименуй одноимённые команды UB, чтобы не было двойной выплаты.")
 
     @commands.hybrid_command(name="cb", description="Состояние Центрального банка")
     async def cb(self, ctx):
