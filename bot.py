@@ -23,7 +23,7 @@ try:
 except Exception:
     InferenceClient = None
 
-BOT_VERSION = "1.9.4"
+BOT_VERSION = "1.9.6"
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 UB_TOKEN = os.getenv("UB_TOKEN")
@@ -184,7 +184,7 @@ class Bot(commands.Bot):
                          help_command=None, activity=discord.Game(name="!cb"), status=discord.Status.online)
         self.mongo = None
         self.db = None
-        self.economy = self.tx = self.funds = self.rates = None
+        self.economy = self.tx = self.funds = self.rates = self.economy_history = None
         self.ub: Optional[UB] = None
         self.hf = None
         self.synced = False
@@ -199,6 +199,7 @@ class Bot(commands.Bot):
         self.tx = self.db.transactions
         self.funds = self.db.funds
         self.rates = self.db.rate_history
+        self.economy_history = self.db.economy_history
         await self.economy.update_one({"_id": "central_bank"}, {"$setOnInsert": {
             "reserve": 0, "printed": 0, "created_at": now()}, "$set": {"updated_at": now()}}, upsert=True)
 
@@ -226,6 +227,7 @@ class Bot(commands.Bot):
         self.report_loop.start()
         self.cleanup_loop.start()
         self.ub_sync_loop.start()
+        self.economy_snapshot_loop.start()
 
     async def on_ready(self):
         log.info("Бот онлайн: %s", self.user)
@@ -239,7 +241,7 @@ class Bot(commands.Bot):
                 log.exception("Fallback sync failed")
 
     async def close(self):
-        for t in (self.report_loop, self.cleanup_loop, self.ub_sync_loop):
+        for t in (self.report_loop, self.cleanup_loop, self.ub_sync_loop, self.economy_snapshot_loop):
             if t.is_running():
                 t.cancel()
         if self.ub:
@@ -289,13 +291,19 @@ class Bot(commands.Bot):
         return int((d or {}).get("printed", 0) or 0)
 
     async def change_reserve(self, delta):
+        """Меняет резерв ЦБ. Резерв МОЖЕТ уходить в минус.
+
+        Отрицательный резерв — это внутренний долг/дефицит ЦБ.
+        Это специально позволяет UB продолжать выдавать деньги через work,
+        crime, casino и другие механики, даже когда свободного резерва уже нет.
+        """
         delta = int(delta)
-        if delta < 0:
-            r = await self.economy.update_one({"_id": "central_bank", "reserve": {"$gte": -delta}},
-                                              {"$inc": {"reserve": delta}, "$set": {"updated_at": now()}})
-        else:
-            r = await self.economy.update_one({"_id": "central_bank"},
-                                              {"$inc": {"reserve": delta}, "$set": {"updated_at": now()}})
+        if delta == 0:
+            return True
+        r = await self.economy.update_one(
+            {"_id": "central_bank"},
+            {"$inc": {"reserve": delta}, "$set": {"updated_at": now()}},
+        )
         return r.modified_count == 1
 
     async def journal(self, source, dest, amount, reason, meta=None):
@@ -313,7 +321,9 @@ class Bot(commands.Bot):
             raise
 
     async def burn(self, amount, reason="Сжигание денег"):
-        if amount <= 0 or not await self.change_reserve(-amount):
+        if amount <= 0 or await self.reserve() < amount:
+            return False
+        if not await self.change_reserve(-amount):
             return False
         try:
             await self.journal("central_bank", "money_burn", amount, reason)
@@ -373,6 +383,46 @@ class Bot(commands.Bot):
             return True
         except Exception:
             log.exception("player->CB failed")
+            raise
+
+    async def transfer_player_to_player(self, sender, recipient, amount: int, reason="Перевод через Центральный банк"):
+        """Перевод между игроками. Деньги физически проходят через наш бот."""
+        if amount <= 0 or sender.id == recipient.id:
+            return False
+
+        source = await self.ub.user(sender.id)
+        source_cash = int((source or {}).get("cash", 0) or 0) if isinstance(source, dict) else 0
+        if source_cash < amount:
+            return False
+
+        # Сначала списываем у отправителя. Оба изменения помечаем ожидаемыми,
+        # чтобы UB sync не посчитал перевод повторно.
+        await self.ub.change_cash(sender.id, -amount, reason)
+        self.expect_balance_change(sender.id, -amount)
+        try:
+            await self.ub.change_cash(recipient.id, amount, reason)
+            self.expect_balance_change(recipient.id, amount)
+            try:
+                await self.journal(
+                    f"user_{sender.id}",
+                    f"user_{recipient.id}",
+                    amount,
+                    reason,
+                    meta={"type": "player_transfer", "sender_id": sender.id, "recipient_id": recipient.id},
+                )
+            except Exception:
+                await self.ub.change_cash(recipient.id, -amount, "Rollback: journal error")
+                self.expect_balance_change(recipient.id, -amount)
+                await self.ub.change_cash(sender.id, amount, "Rollback: journal error")
+                self.expect_balance_change(sender.id, amount)
+                raise
+            return True
+        except Exception:
+            try:
+                await self.ub.change_cash(sender.id, amount, "Rollback: transfer error")
+                self.expect_balance_change(sender.id, amount)
+            except Exception:
+                log.exception("Could not rollback sender transfer for %s", sender.id)
             raise
 
     # ---------------- Funds ----------------
@@ -474,6 +524,32 @@ class Bot(commands.Bot):
             return ok, fine, pct
         return True, 0, pct
 
+    async def record_economy_snapshot(self, force=False):
+        """Сохраняет снимок экономики для общего и 24ч графиков."""
+        try:
+            last = await self.economy_history.find_one(sort=[("created_at", -1)])
+            current_time = now()
+            if not force and last:
+                last_time = last.get("created_at")
+                if isinstance(last_time, datetime) and (current_time - last_time).total_seconds() < 300:
+                    return
+
+            r, f, p = await asyncio.gather(self.reserve(), self.funds_total(), self.ub.total())
+            circulation = f + p
+            total_system = r + circulation
+            debt = max(0, -r)
+            await self.economy_history.insert_one({
+                "created_at": current_time,
+                "reserve": r,
+                "funds": f,
+                "players": p,
+                "circulation": circulation,
+                "debt": debt,
+                "supply": total_system,
+            })
+        except Exception:
+            log.exception("Economy snapshot failed")
+
     async def stats(self):
         r, f, p, pr = await asyncio.gather(self.reserve(), self.funds_total(), self.ub.total(), self.printed())
         since = now() - timedelta(hours=24)
@@ -484,7 +560,11 @@ class Bot(commands.Bot):
             s, a = str(x.get("_id", "")), int(x.get("amount", 0) or 0)
             if s == "central_bank": outgoing += a
             elif s.startswith("user_") or s.startswith("fund_"): incoming += a
-        return {"reserve": r, "funds": f, "players": p, "supply": r + f + p, "printed": pr,
+        circulation = f + p
+        debt = max(0, -r)
+        total_system = r + circulation
+        return {"reserve": r, "funds": f, "players": p, "circulation": circulation,
+                "debt": debt, "supply": total_system, "printed": pr,
                 "incoming": incoming, "outgoing": outgoing}
 
     async def rate(self):
@@ -507,7 +587,11 @@ class Bot(commands.Bot):
                 c[code] = rub_value / nominal_value if nominal_value else 0
 
         import math
-        internal = round(1000 / math.sqrt(1 + max(0, s["supply"]) / 100000), 2)
+        # Курс реагирует на деньги в обращении и на дефицит ЦБ.
+        # Поэтому отрицательный резерв создаёт инфляционное давление,
+        # а не исчезает из расчёта из-за max(0, supply).
+        economic_mass = max(0, s["circulation"]) + s["debt"]
+        internal = round(1000 / math.sqrt(1 + economic_mass / 100000), 2)
         usd_rub = c.get("USD", 0)
         eur_rub = c.get("EUR", 0)
         cny_rub = c.get("CNY", 0)
@@ -625,6 +709,15 @@ class Bot(commands.Bot):
     async def before_ub_sync(self):
         await self.wait_until_ready()
 
+    @tasks.loop(minutes=5)
+    async def economy_snapshot_loop(self):
+        await self.record_economy_snapshot()
+
+    @economy_snapshot_loop.before_loop
+    async def before_economy_snapshot(self):
+        await self.wait_until_ready()
+        await self.record_economy_snapshot(force=True)
+
     @tasks.loop(minutes=1)
     async def report_loop(self):
         t = now()
@@ -671,7 +764,7 @@ class Cog(commands.Cog):
                        "`!print_money` `!burn_money` `!cb_test`\n"
                        "`!fund` `!fund_create` `!fund_add` `!fund_take` `!fund_delete`\n\n"
                        "💡 UnbelievaBoat остаётся игровой экономикой сервера. ЦБ автоматически учитывает "
-                       "изменения балансов игроков и корректирует свой резерв. Свои work/crime/казино ЦБ не подменяет.")
+                       "переводы между игроками проводятся только через ЦБ. UB остаётся хранилищем игровых балансов.")
 
     @commands.hybrid_command(name="cb", description="Состояние Центрального банка")
     async def cb(self, ctx):
@@ -679,7 +772,9 @@ class Cog(commands.Cog):
         try:
             s = await self.bot.stats()
             await ctx.send(f"🏦 **ЦБ**\nРезерв: `{fmt(s['reserve'])}`\nФонды: `{fmt(s['funds'])}`\n"
+                           f"В обращении: `{fmt(s['circulation'])}`\n"
                            f"Всего в системе: `{fmt(s['supply'])}`\n"
+                           f"Дефицит ЦБ: `{fmt(s['debt'])}`\n"
                            f"Напечатано: `{fmt(s['printed'])}`")
         except Exception as e:
             await ctx.send(f"❌ Ошибка: `{str(e)[:500]}`")
@@ -690,7 +785,8 @@ class Cog(commands.Cog):
         try:
             s = await self.bot.stats()
             await ctx.send(f"📈 **Экономика**\nРезерв `{fmt(s['reserve'])}` | Фонды `{fmt(s['funds'])}` | "
-                           f"Масса `{fmt(s['supply'])}`\n"
+                           f"В обращении `{fmt(s['circulation'])}` | Дефицит `{fmt(s['debt'])}`\n"
+                           f"Всего в системе `{fmt(s['supply'])}`\n"
                            f"24ч: приход `{fmt(s['incoming'])}` / расход `{fmt(s['outgoing'])}`\n"
                            f"Напечатано всего: `{fmt(s['printed'])}`")
         except Exception as e:
@@ -734,6 +830,27 @@ class Cog(commands.Cog):
             await ctx.send(f"✅ {member.mention} получил `{fmt(amount)}`. Резерв: `{fmt(await self.bot.reserve())}`")
         except Exception as e:
             await ctx.send(f"❌ Ошибка UB/ЦБ: `{str(e)[:500]}`")
+
+    @commands.hybrid_command(name="transfer", description="Перевести деньги игроку через ЦБ")
+    @app_commands.describe(member="Получатель", amount="Сумма")
+    async def transfer(self, ctx, member: discord.Member, amount: int):
+        if amount <= 0:
+            return await ctx.send("❌ Сумма должна быть > 0")
+        if member.id == ctx.author.id:
+            return await ctx.send("❌ Нельзя переводить самому себе")
+        await ctx.defer()
+        try:
+            ok = await self.bot.transfer_player_to_player(
+                ctx.author, member, amount, "Перевод через Центральный банк"
+            )
+            if not ok:
+                return await ctx.send("❌ Недостаточно денег для перевода")
+            await ctx.send(
+                f"💸 {ctx.author.mention} → {member.mention}: `{fmt(amount)}`\n"
+                f"Перевод проведён через Центральный банк."
+            )
+        except Exception as e:
+            await ctx.send(f"❌ Ошибка перевода: `{str(e)[:500]}`")
 
     @commands.hybrid_command(name="fund", description="Список фондов")
     async def fund(self, ctx):
@@ -792,7 +909,7 @@ class Cog(commands.Cog):
         await ctx.defer()
         try:
             s = await self.bot.stats(); tx = await self.bot.tx.count_documents({})
-            await ctx.send(f"🔎 **Аудит**\nРезерв `{fmt(s['reserve'])}` + фонды `{fmt(s['funds'])}` + обращение = `{fmt(s['supply'])}`\n"
+            await ctx.send(f"🔎 **Аудит**\nРезерв `{fmt(s['reserve'])}` + обращение `{fmt(s['circulation'])}` = `{fmt(s['supply'])}`\n"
                            f"Напечатано `{fmt(s['printed'])}` | операций `{tx}`\nСтатус: ✅ баланс сходится")
         except Exception as e: await ctx.send(f"❌ Ошибка: `{str(e)[:500]}`")
 
@@ -808,15 +925,56 @@ class Cog(commands.Cog):
                            f"Масса `{fmt(r['supply'])}`")
         except Exception as e: await ctx.send(f"❌ Ошибка: `{str(e)[:500]}`")
 
-    @commands.hybrid_command(name="chart", description="График курса")
+    @commands.hybrid_command(name="chart", description="Общие графики экономики")
     async def chart(self, ctx):
         await ctx.defer()
-        rows = await self.bot.rates.find().sort("created_at", 1).to_list(500)
-        if len(rows) < 2: return await ctx.send("❌ Нужно минимум 2 записи курса")
-        path = "/tmp/cb_rate.png"
-        plt.figure(figsize=(10, 5)); plt.plot([x["created_at"] for x in rows], [x["internal"] for x in rows]);
-        plt.title("Внутренний курс ЦБ"); plt.xlabel("Дата"); plt.ylabel("Курс"); plt.grid(True, alpha=.25); plt.xticks(rotation=30); plt.tight_layout(); plt.savefig(path, dpi=150); plt.close()
-        await ctx.send(file=discord.File(path, filename="cb_rate.png"))
+        try:
+            all_rows = await self.bot.economy_history.find().sort("created_at", 1).to_list(5000)
+            if len(all_rows) < 2:
+                return await ctx.send("❌ Пока недостаточно данных. График начнёт накапливаться автоматически.")
+
+            since = now() - timedelta(hours=24)
+            day_rows = [x for x in all_rows if isinstance(x.get("created_at"), datetime) and x["created_at"] >= since]
+            if len(day_rows) < 2:
+                return await ctx.send("❌ Для графика за 24 часа пока недостаточно данных.")
+
+            def make_chart(rows, title, filename):
+                path = f"/tmp/{filename}"
+                dates = [x["created_at"].astimezone(timezone.utc) for x in rows]
+                reserve = [int(x.get("reserve", 0) or 0) for x in rows]
+                circulation = [int(x.get("circulation", (int(x.get("funds", 0) or 0) + int(x.get("players", 0) or 0))) or 0) for x in rows]
+                debt = [int(x.get("debt", max(0, -int(x.get("reserve", 0) or 0))) or 0) for x in rows]
+                plt.figure(figsize=(11, 5.5))
+                plt.plot(dates, reserve, linewidth=2, label="Резерв ЦБ")
+                plt.plot(dates, circulation, linewidth=2, label="В обращении")
+                plt.plot(dates, debt, linewidth=2, label="Дефицит ЦБ")
+                plt.axhline(0, linewidth=1)
+                plt.title(title)
+                plt.xlabel("Время")
+                plt.ylabel("Сумма")
+                plt.grid(True, alpha=.25)
+                plt.legend()
+                plt.xticks(rotation=30)
+                plt.tight_layout()
+                plt.savefig(path, dpi=150)
+                plt.close()
+                return path
+
+            overall = make_chart(all_rows, "Общая экономика — денежная масса", "cb_economy_all.png")
+            last24 = make_chart(day_rows, "Экономика за последние 24 часа", "cb_economy_24h.png")
+
+            await ctx.send(
+                "📊 **Графики экономики**\n"
+                "1️⃣ Общий график — вся накопленная история\n"
+                "2️⃣ График за 24 часа — последние сутки",
+                files=[
+                    discord.File(overall, filename="cb_economy_all.png"),
+                    discord.File(last24, filename="cb_economy_24h.png"),
+                ],
+            )
+        except Exception as e:
+            log.exception("Economy chart failed")
+            await ctx.send(f"❌ Ошибка графика: `{str(e)[:500]}`")
 
     @commands.hybrid_command(name="history", description="Журнал операций")
     @app_commands.describe(limit="Количество записей")
