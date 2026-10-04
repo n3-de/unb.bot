@@ -72,6 +72,15 @@ def now():
     return datetime.now(timezone.utc)
 
 
+def as_utc_datetime(value):
+    """Return a datetime as timezone-aware UTC, or None for invalid values."""
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def fmt(n):
     return f"{int(n):,}".replace(",", " ")
 
@@ -722,9 +731,9 @@ class Bot(commands.Bot):
             current_time = now()
 
             if not force and last:
-                last_time = last.get("created_at")
+                last_time = as_utc_datetime(last.get("created_at"))
                 if (
-                    isinstance(last_time, datetime)
+                    last_time is not None
                     and (current_time - last_time).total_seconds() < 300
                 ):
                     return False
@@ -751,8 +760,8 @@ class Bot(commands.Bot):
                 }
             )
             return True
-        except Exception:
-            log.exception("Economy snapshot failed")
+        except Exception as e:
+            log.exception("Economy snapshot failed: %s", e)
             return False
 
     # -------------------- Chart Rendering --------------------
@@ -769,9 +778,11 @@ class Bot(commands.Bot):
     @staticmethod
     def _render_chart(chart_rows, title, path):
         dates = [
-            row["created_at"].astimezone(timezone.utc)
+            as_utc_datetime(row["created_at"])
             for row in chart_rows
         ]
+        if any(value is None for value in dates):
+            raise RuntimeError("Некорректные даты в данных графика")
 
         reserve = [
             int(row.get("reserve", 0) or 0)
@@ -853,12 +864,15 @@ class Bot(commands.Bot):
                     "debt": 1,
                     "supply": 1,
                 },
-            ).sort("created_at", 1).to_list(None)
+            ).sort("created_at", 1).to_list(100000)
 
-            clean_rows = [
-                row for row in rows
-                if isinstance(row.get("created_at"), datetime)
-            ]
+            clean_rows = []
+            for row in rows:
+                created_at = as_utc_datetime(row.get("created_at"))
+                if created_at is not None:
+                    normalized = dict(row)
+                    normalized["created_at"] = created_at
+                    clean_rows.append(normalized)
 
             if not clean_rows:
                 log.warning("Нет данных economy_history.")
@@ -876,19 +890,21 @@ class Bot(commands.Bot):
             all_render_rows = self._downsample_rows(clean_rows, 2500)
             day_render_rows = self._downsample_rows(day_rows, 1500)
 
-            await asyncio.gather(
-                asyncio.to_thread(
-                    self._render_chart,
-                    all_render_rows,
-                    "Общая экономика — денежная масса",
-                    self.chart_files["all"],
-                ),
-                asyncio.to_thread(
-                    self._render_chart,
-                    day_render_rows,
-                    "Экономика — последние 24 часа",
-                    self.chart_files["24h"],
-                ),
+            if not all_render_rows or not day_render_rows:
+                raise RuntimeError("Недостаточно данных для построения графика")
+
+            # Matplotlib rendering is sequential to avoid pyplot/global-state races.
+            await asyncio.to_thread(
+                self._render_chart,
+                all_render_rows,
+                "Общая экономика — денежная масса",
+                self.chart_files["all"],
+            )
+            await asyncio.to_thread(
+                self._render_chart,
+                day_render_rows,
+                "Экономика — последние 24 часа",
+                self.chart_files["24h"],
             )
 
             for key, path in self.chart_files.items():
@@ -902,8 +918,8 @@ class Bot(commands.Bot):
             )
             return True
 
-        except Exception:
-            log.exception("Economy chart generation failed")
+        except Exception as e:
+            log.exception("Economy chart generation failed: %s", e)
             return False
 
     async def publish_economy_charts(self):
