@@ -1655,24 +1655,9 @@ class Bot(commands.Bot):
                     or await self.fetch_channel(REPORT_CHANNEL_ID)
                 )
 
-                # Обновляем графики перед отправкой отчёта.
-                await self.publish_economy_charts()
-
-                files = []
-                for key, filename in (
-                    ("all", "cb_economy_all.png"),
-                    ("24h", "cb_economy_24h.png"),
-                ):
-                    path = self.chart_files[key]
-                    if os.path.exists(path):
-                        files.append(
-                            discord.File(path, filename=filename)
-                        )
-
-                await channel.send(
-                    embed=embed,
-                    files=files,
-                )
+                # Графики не прикрепляем к ежедневному отчёту.
+                # Их постоянное сообщение обновляется отдельно каждые 5 минут.
+                await channel.send(embed=embed)
 
             except Exception:
                 # Если отчёт не отправился, разрешаем повторную попытку
@@ -2110,11 +2095,12 @@ class Cog(commands.Cog):
 
     @commands.hybrid_command(
         name="chart",
-        description="Обновить графики экономики",
+        description="Отправить графики экономики",
     )
     async def chart(self, ctx):
         await ctx.defer()
         try:
+            # Обновляем графики и постоянное сообщение в CHART_CHANNEL_ID.
             ok = await self.bot.publish_economy_charts()
 
             if not ok:
@@ -2123,10 +2109,23 @@ class Cog(commands.Cog):
                     "Проверь логи бота."
                 )
 
+            # Команда всегда отправляет графики ещё одним НОВЫМ сообщением
+            # туда, где была вызвана команда.
+            files = []
+            for key, filename in (
+                ("all", "cb_economy_all.png"),
+                ("24h", "cb_economy_24h.png"),
+            ):
+                path = self.bot.chart_files[key]
+                if os.path.exists(path):
+                    files.append(discord.File(path, filename=filename))
+
             await ctx.send(
-                "✅ **Графики экономики обновлены.**\n"
-                "Постоянное сообщение с графиками также обновлено."
+                "📊 **Графики экономики**\n"
+                "Постоянное сообщение в канале графиков также обновлено.",
+                files=files,
             )
+
         except Exception as e:
             log.exception("Economy chart command failed")
             await ctx.send(
